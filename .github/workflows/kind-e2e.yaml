@@ -10,7 +10,7 @@ on:
 jobs:
   e2e-kind:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
@@ -199,7 +199,7 @@ jobs:
         # the tests so GH Actions keeps the background process alive.
         # MEDIK8S_REBOOT_DELAY gives NHC time to detect the unhealthy node
         # and create the remediation CR before the node comes back.
-        export MEDIK8S_REBOOT_DELAY=120
+        export MEDIK8S_REBOOT_DELAY=60
         make dev-reboot-watcher
 
         echo "=== Verifying Operator Pods ==="
