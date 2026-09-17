@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NHC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SNR_DIR="${NHC_DIR}/.snr"
+SNR_DIR="/tmp/.snr"
 TOOLS_DIR="${NHC_DIR}/.tools"
 
 export DEPLOY_SNR_NAMESPACE="${DEPLOY_SNR_NAMESPACE:-snr-system}"

@@ -41,7 +41,7 @@ jobs:
       uses: actions/checkout@v6
       with:
         repository: medik8s/self-node-remediation
-        path: .snr
+        path: /tmp/.snr
         fetch-depth: 0
         persist-credentials: false
 
@@ -68,7 +68,7 @@ jobs:
 
 # --- Build and deploy SNR from source ---
     - name: Build and push SNR
-      working-directory: .snr
+      working-directory: /tmp/.snr
       run: |
         SNR_IMG=${IMAGE_REGISTRY}/self-node-remediation:latest
         SNR_BUNDLE=${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
@@ -175,21 +175,6 @@ jobs:
           echo "WARNING: aggregation ClusterRole not found, controller may not be ready yet. Waiting 30s more..."
           sleep 30
         fi
-
-    - name: Wait for SNR webhook readiness
-      run: |
-        # After patching deployments and OLM reverting them, the SNR webhook
-        # may be temporarily unavailable. Wait until we can actually call it
-        # before proceeding to tests.
-        echo "Waiting for SNR webhook to become ready..."
-        for i in $(seq 1 12); do
-          if kubectl get snrt -n ${DEPLOY_SNR_NAMESPACE} 2>/dev/null; then
-            echo "SNR webhook is responding."
-            break
-          fi
-          echo "Attempt $i/12: SNR webhook not ready, waiting 10s..."
-          sleep 10
-        done
 
     - name: Dump webhook configurations after bundle installs
       run: |
