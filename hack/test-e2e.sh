@@ -5,6 +5,22 @@ export SNRT_NAME=${SNRT_NAME:-self-node-remediation-automatic-strategy-template}
 
 set -e
 
+retry() {
+  local retries=$1
+  local wait=$2
+  shift 2
+  local n=0
+  until "$@"; do
+    n=$((n+1))
+    if [ $n -ge $retries ]; then
+      echo "Command failed after $retries attempts: $*"
+      return 1
+    fi
+    echo "Retry $n/$retries failed. Retrying in $wait seconds..."
+    sleep $wait
+  done
+}
+
 goTest() {
   (
     # don't stop on errors here only, and print full command
@@ -24,7 +40,7 @@ if [[ -n ${SNR_STRATEGY} ]]; then
   TEMPLATE_NAME=${TEMPLATE_NAME,,}
   export SNRT_NAME=${TEMPLATE_NAME}
   kubectl -n "${OPERATOR_NS}" delete snrt "${SNRT_NAME}" --ignore-not-found=true
-  cat <<EOF | kubectl create -f -
+  retry 5 10 bash -c "cat <<INNEREOF | kubectl create -f -
 apiVersion: self-node-remediation.medik8s.io/v1alpha1
 kind: SelfNodeRemediationTemplate
 metadata:
@@ -34,7 +50,7 @@ spec:
   template:
     spec:
       remediationStrategy: ${SNR_STRATEGY}
-EOF
+INNEREOF"
 fi
 
 # no colors in CI
@@ -57,25 +73,6 @@ if [[ -z "${OPENSHIFT_CI}" ]]; then
   echo "not running in Openshift CI, skipping MHC test"
   exit $exitCode
 fi
-
-retry() {
-  local retries=$1
-  local wait=$2
-  shift 2
-  local n=0
-  # The 'until' command repeatedly executes the given command(s) until they succeed (i.e., return a zero exit status).
-  # In this context, "$@" represents the command and its arguments passed to the retry function.
-  # The loop will continue to run the command until it succeeds or the maximum number of retries is reached.
-  until "$@"; do
-    n=$((n+1))
-    if [ $n -ge $retries ]; then
-      echo "Command failed after $retries attempts: $*"
-      return 1
-    fi
-    echo "Retry $n/$retries failed. Retrying in $wait seconds..."
-    sleep $wait
-  done
-}
 
 echo "Waiting until cluster is healthy after NHC tests"
 retry 5 30 oc wait --for=condition=Progressing=False --timeout=2m --all clusteroperators

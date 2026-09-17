@@ -176,6 +176,21 @@ jobs:
           sleep 30
         fi
 
+    - name: Wait for SNR webhook readiness
+      run: |
+        # After patching deployments and OLM reverting them, the SNR webhook
+        # may be temporarily unavailable. Wait until we can actually call it
+        # before proceeding to tests.
+        echo "Waiting for SNR webhook to become ready..."
+        for i in $(seq 1 12); do
+          if kubectl get snrt -n ${DEPLOY_SNR_NAMESPACE} 2>/dev/null; then
+            echo "SNR webhook is responding."
+            break
+          fi
+          echo "Attempt $i/12: SNR webhook not ready, waiting 10s..."
+          sleep 10
+        done
+
     - name: Dump webhook configurations after bundle installs
       run: |
         # Both SNR and NHC bundles register webhooks for SNR resources.
