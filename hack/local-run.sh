@@ -1,11 +1,8 @@
 #!/bin/bash
 # local-run.sh — Replicate the Kind e2e GitHub Actions workflow locally
 #
-# Uses local checkouts of NHC, SNR, and tools instead of cloning from GitHub.
-# Assumes standard medik8s directory layout:
-#   upstream/operators/node-healthcheck-operator  (this repo)
-#   upstream/operators/self-node-remediation
-#   upstream/shared/tools
+# Deploys SNR from quay.io and builds NHC from local source.
+# Tools are cloned automatically.
 #
 # Usage:
 #   ./hack/local-run.sh              # Full run (setup + build + deploy + test)
@@ -17,7 +14,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NHC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SNR_DIR="/tmp/.snr"
 TOOLS_DIR="${NHC_DIR}/.tools"
 
 export DEPLOY_SNR_NAMESPACE="${DEPLOY_SNR_NAMESPACE:-snr-system}"
@@ -29,14 +25,6 @@ if [ ! -d "${TOOLS_DIR}" ]; then
 else
     echo "Updating existing .tools directory..."
     (cd "${TOOLS_DIR}" && git fetch origin testing-hang && git reset --hard origin/testing-hang)
-fi
-
-# Clone or update .snr directory
-if [ ! -d "${SNR_DIR}" ]; then
-    git clone --depth 1 https://github.com/medik8s/self-node-remediation $SNR_DIR
-else
-    echo "Updating existing .snr directory..."
-    (cd "${SNR_DIR}" && git fetch origin main && git reset --hard origin/main)
 fi
 
 # --- Configuration (mirrors GitHub Actions env) ---
@@ -58,8 +46,6 @@ export IMAGE_REGISTRY="${IMAGE_REGISTRY:-${MEDIK8S_REGISTRY_NAME}:${MEDIK8S_REGI
 export OPM_RENDER_FLAGS="${OPM_RENDER_FLAGS:---skip-tls-verify}"
 export TOOLS_DIR
 
-SNR_IMG="${IMAGE_REGISTRY}/self-node-remediation:latest"
-SNR_BUNDLE="${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest"
 NHC_IMG="${IMAGE_REGISTRY}/node-healthcheck-operator:latest"
 NHC_BUNDLE="${IMAGE_REGISTRY}/node-healthcheck-operator-bundle:latest"
 
@@ -94,11 +80,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Validate local directories ---
-if [ ! -d "${SNR_DIR}" ]; then
-    echo "Error: SNR directory not found at ${SNR_DIR}"
-    echo "Expected standard layout: upstream/operators/self-node-remediation"
-    exit 1
-fi
 if [ ! -d "${TOOLS_DIR}" ]; then
     echo "Error: Tools directory not found at ${TOOLS_DIR}"
     echo "Expected standard layout: upstream/shared/tools"
@@ -109,9 +90,6 @@ echo "=== Local repositories ==="
 echo "  NHC:   ${NHC_DIR}"
 echo "         branch: $(cd "${NHC_DIR}" && git branch --show-current)"
 echo "         commit: $(cd "${NHC_DIR}" && git log --oneline -1)"
-echo "  SNR:   ${SNR_DIR}"
-echo "         branch: $(cd "${SNR_DIR}" && git branch --show-current)"
-echo "         commit: $(cd "${SNR_DIR}" && git log --oneline -1)"
 echo "  Tools: ${TOOLS_DIR}"
 echo "         branch: $(cd "${TOOLS_DIR}" && git branch --show-current)"
 echo "         commit: $(cd "${TOOLS_DIR}" && git log --oneline -1)"
@@ -133,7 +111,7 @@ check_and_cleanup_existing_build() {
     local image
 
     echo "=== Checking for existing local build artifacts ==="
-    for image in "${SNR_IMG}" "${SNR_BUNDLE}" "${NHC_IMG}" "${NHC_BUNDLE}"; do
+    for image in "${NHC_IMG}" "${NHC_BUNDLE}"; do
         if image_exists "${image}"; then
             echo "  Found image: ${image}"
             found=true
@@ -142,7 +120,7 @@ check_and_cleanup_existing_build() {
 
     if [ "${found}" = true ]; then
         echo "  Removing existing local operator images..."
-        for image in "${SNR_IMG}" "${SNR_BUNDLE}" "${NHC_IMG}" "${NHC_BUNDLE}"; do
+        for image in "${NHC_IMG}" "${NHC_BUNDLE}"; do
             "${CONTAINER_TOOL}" image rm -f "${image}" >/dev/null 2>&1 || true
         done
         echo "  Existing local build artifacts removed."
@@ -214,31 +192,16 @@ if [ "${SKIP_BUILD}" = false ]; then
     check_and_cleanup_existing_build
     check_and_cleanup_existing_deployment
 
-    step "Building and pushing SNR"
-    cd "${SNR_DIR}"
-
-    # SNR Makefile hardcodes 'docker' — build directly with ${CONTAINER_TOOL}
-    make test
-    ${CONTAINER_TOOL} build -t ${SNR_IMG} .
-    ${CONTAINER_TOOL} push --tls-verify=false ${SNR_IMG}
-
-    make bundle IMG=${SNR_IMG}
-    ${CONTAINER_TOOL} build -f bundle.Dockerfile -t ${SNR_BUNDLE} .
-    ${CONTAINER_TOOL} push --tls-verify=false ${SNR_BUNDLE}
-
-    step "Deploying SNR via OLM bundle"
+    step "Deploying SNR from quay.io"
     cd "${NHC_DIR}"
     kubectl create ns ${DEPLOY_SNR_NAMESPACE} 2>/dev/null || true
     kubectl label --overwrite ns ${DEPLOY_SNR_NAMESPACE} \
         pod-security.kubernetes.io/enforce=privileged \
         pod-security.kubernetes.io/audit=privileged \
         pod-security.kubernetes.io/warn=privileged
-    operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} --use-http \
+    operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} \
         --timeout 5m \
-        ${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
-
-    # Patch SNR immediately to move it to the control plane
-    kubectl patch deployment self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
+        quay.io/medik8s/self-node-remediation-operator-bundle:latest
 
     step "Building and pushing NHC"
     cd "${NHC_DIR}"

@@ -37,14 +37,6 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
 
-    - name: Checkout SNR
-      uses: actions/checkout@v6
-      with:
-        repository: medik8s/self-node-remediation
-        path: ../.snr
-        fetch-depth: 0
-        persist-credentials: false
-
     - name: Setup Go
       uses: actions/setup-go@v6
       with:
@@ -52,7 +44,7 @@ jobs:
 
     - name: Clone medik8s/tools
       run: |
-        git clone --depth 1 --branch testing-hang https://github.com/mpryc/medik8s-tools.git $TOOLS_DIR 
+        git clone --depth 1 --branch testing-hang https://github.com/mpryc/medik8s-tools.git $TOOLS_DIR
         touch $TOOLS_DIR/.managed-by-makefile
 
     - name: Install operator-sdk
@@ -66,19 +58,7 @@ jobs:
     - name: Cluster info
       run: make dev-cluster-info
 
-# --- Build and deploy SNR from source ---
-    - name: Build and push SNR
-      working-directory: ../.snr
-      run: |
-        SNR_IMG=${IMAGE_REGISTRY}/self-node-remediation:latest
-        SNR_BUNDLE=${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
-
-        make docker-build IMG=${SNR_IMG} CONTAINER_TOOL=docker
-        docker push ${SNR_IMG}
-
-        make bundle bundle-build IMG=${SNR_IMG} BUNDLE_IMG=${SNR_BUNDLE} CONTAINER_TOOL=docker
-        docker push ${SNR_BUNDLE}
-
+# --- Deploy SNR from quay.io ---
     - name: Deploy SNR via OLM bundle
       run: |
         kubectl create ns ${DEPLOY_SNR_NAMESPACE}
@@ -86,16 +66,9 @@ jobs:
           pod-security.kubernetes.io/enforce=privileged \
           pod-security.kubernetes.io/audit=privileged \
           pod-security.kubernetes.io/warn=privileged
-        operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} --use-http \
+        operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} \
           --timeout 5m \
-          ${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
-
-    - name: Free Disk Space & RAM
-      run: |
-        # Reclaim disk/RAM on the CI runner after SNR build; images are
-        # already pushed to the Kind registry so local copies aren't needed.
-        podman image prune -a -f
-        podman builder prune -a -f
+          quay.io/medik8s/self-node-remediation-operator-bundle:latest
 
     # --- Build and deploy NHC ---
     - name: Build and push NHC
