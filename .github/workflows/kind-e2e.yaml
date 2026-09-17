@@ -25,6 +25,9 @@ jobs:
       IMAGE_REGISTRY: kind-registry:5000
       OPM_RENDER_FLAGS: --skip-tls-verify
 
+      # Cluster
+      KIND_EXTRA_WORKERS: "true"
+
       # Deployment
       DEPLOY_SNR_NAMESPACE: snr-system
       DEPLOY_NHC_NAMESPACE: k8s-test
@@ -133,27 +136,7 @@ jobs:
         kubectl rollout status deployment/node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s
         make dev-wait
 
-    - name: Move operator pods to control plane
-      run: |
-        # E2e tests stop kubelet on worker nodes, which kills pods on those
-        # workers. Move operator manager pods to the control-plane node so
-        # they survive the simulated failures.
-        #
-        # NOTE: OLM continuously reconciles deployment specs to match the CSV.
-        # It will revert these patches eventually. We patch AFTER rollout is
-        # complete and immediately wait for the new rollout so the pods have
-        # time to reschedule before OLM reverts. The sleep below also gives
-        # OLM time to finish its reconciliation cycle.
-        kubectl patch deployment self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} \
-          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
-
-        kubectl patch deployment node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} \
-          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
-
-        kubectl rollout status deployment/self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} --timeout=120s
-        kubectl rollout status deployment/node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s
-
-    - name: Cluster state (after move to control plane)
+    - name: Cluster state (after deploy)
       if: ${{ always() }}
       run: |
         echo "=== Pods ===" && kubectl get pods -A -o wide 2>/dev/null || true

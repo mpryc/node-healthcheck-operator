@@ -29,6 +29,7 @@ fi
 
 # --- Configuration (mirrors GitHub Actions env) ---
 export MEDIK8S_CLUSTER_NAME="${MEDIK8S_CLUSTER_NAME:-medik8s-ci}"
+export KIND_EXTRA_WORKERS="${KIND_EXTRA_WORKERS:-true}"
 if [ -z "${CONTAINER_TOOL:-}" ]; then
     if command -v podman &>/dev/null; then
         export CONTAINER_TOOL=podman
@@ -223,11 +224,9 @@ if [ "${SKIP_BUILD}" = false ]; then
         --timeout 5m \
         ${IMAGE_REGISTRY}/node-healthcheck-operator-bundle:latest
 
-    # Patch NHC immediately to move it to the control plane
-    kubectl patch deployment node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
-    
-    echo "Waiting 60s for operators to reschedule to control plane and stabilize..."
-    sleep 60
+    echo "Waiting for operator deployments to be ready..."
+    kubectl rollout status deployment/node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s
+    kubectl rollout status deployment/self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} --timeout=120s
 else
     echo "Skipping build (--skip-build)"
 fi
