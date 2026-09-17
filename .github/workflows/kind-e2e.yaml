@@ -26,7 +26,9 @@ jobs:
       OPM_RENDER_FLAGS: --skip-tls-verify
 
       # Deployment
-      DEPLOY_NAMESPACE: k8s-test
+      DEPLOY_SNR_NAMESPACE: snr-system
+      DEPLOY_NHC_NAMESPACE: k8s-test
+      
 
     steps:
     - name: Checkout NHC
@@ -50,7 +52,7 @@ jobs:
 
     - name: Clone medik8s/tools
       run: |
-        git clone --depth 1 https://github.com/medik8s/tools.git $TOOLS_DIR
+        git clone --depth 1 --branch testing-hang https://github.com/mpryc/medik8s-tools.git $TOOLS_DIR 
         touch $TOOLS_DIR/.managed-by-makefile
 
     - name: Install operator-sdk
@@ -61,13 +63,10 @@ jobs:
     - name: Create Kind cluster with registry, OLM, and cert-manager
       run: make dev-setup
 
-    - name: Start reboot watcher (simulates node reboot on Kind)
-      run: make dev-reboot-watcher
-
     - name: Cluster info
       run: make dev-cluster-info
 
-    # --- Build and deploy SNR from source ---
+# --- Build and deploy SNR from source ---
     - name: Build and push SNR
       working-directory: .snr
       run: |
@@ -82,13 +81,23 @@ jobs:
 
     - name: Deploy SNR via OLM bundle
       run: |
-        kubectl create ns ${DEPLOY_NAMESPACE}
-        kubectl label --overwrite ns ${DEPLOY_NAMESPACE} \
+        kubectl create ns ${DEPLOY_SNR_NAMESPACE}
+        kubectl label --overwrite ns ${DEPLOY_SNR_NAMESPACE} \
           pod-security.kubernetes.io/enforce=privileged \
           pod-security.kubernetes.io/audit=privileged \
           pod-security.kubernetes.io/warn=privileged
-        operator-sdk run bundle -n ${DEPLOY_NAMESPACE} --use-http \
+        operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} --use-http \
+          --timeout 5m \
           ${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
+
+        # Patch SNR immediately to move it to the control plane
+        kubectl patch deployment self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} \
+          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
+
+    - name: Free Disk Space & RAM
+      run: |
+        podman image prune -a -f
+        podman builder prune -a -f
 
     # --- Build and deploy NHC ---
     - name: Build and push NHC
@@ -105,12 +114,40 @@ jobs:
 
     - name: Deploy NHC via OLM bundle
       run: |
-        operator-sdk run bundle -n ${DEPLOY_NAMESPACE} --use-http \
+        kubectl create ns ${DEPLOY_NHC_NAMESPACE}
+        kubectl label --overwrite ns ${DEPLOY_NHC_NAMESPACE} \
+          pod-security.kubernetes.io/enforce=privileged \
+          pod-security.kubernetes.io/audit=privileged \
+          pod-security.kubernetes.io/warn=privileged
+
+        operator-sdk run bundle -n ${DEPLOY_NHC_NAMESPACE} --use-http \
+          --timeout 5m \
           ${IMAGE_REGISTRY}/node-healthcheck-operator-bundle:latest
-        sleep 1m
+
+        # Patch NHC immediately to move it to the control plane
+        kubectl patch deployment node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} \
+          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
+
+        # Grant NHC explicit cluster-wide permissions to manage SNR templates and CRs
+        kubectl create clusterrolebinding nhc-snr-admin-binding \
+          --clusterrole=self-node-remediation-ext-remediation \
+          --serviceaccount=${DEPLOY_NHC_NAMESPACE}:node-healthcheck-operator-controller-manager \
+          2>/dev/null || true
+
+        echo "Waiting for operators to reschedule to control plane and stabilize..."
+        sleep 60
+        kubectl wait --for=condition=Ready pod -l control-plane=controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s || true
 
     - name: Wait for deployments
       run: make dev-wait
+
+    - name: Dump webhook configurations after bundle installs
+      run: |
+        echo "=== MutatingWebhookConfiguration YAML ==="
+        kubectl get mutatingwebhookconfigurations -o yaml
+        echo ""
+        echo "=== ValidatingWebhookConfiguration YAML ==="
+        kubectl get validatingwebhookconfigurations -o yaml
 
     - name: Deployment status
       if: ${{ always() }}
@@ -120,7 +157,7 @@ jobs:
     - name: Verify NHC readiness
       run: |
         echo "=== NHC Controller Pod ==="
-        kubectl get pods -n ${DEPLOY_NAMESPACE} -l control-plane=controller-manager -o wide
+        kubectl get pods -n ${DEPLOY_NHC_NAMESPACE} -l control-plane=controller-manager -o wide
         echo ""
         echo "=== SNR Template CRDs ==="
         kubectl get crd selfnoderemediationtemplates.self-node-remediation.medik8s.io 2>/dev/null && echo "CRD exists" || echo "CRD MISSING"
@@ -133,9 +170,9 @@ jobs:
         kubectl get clusterrole self-node-remediation-ext-remediation -o yaml 2>/dev/null || echo "ext-remediation ClusterRole NOT FOUND"
         echo ""
         echo "=== NHC Controller Logs (last 30 lines) ==="
-        NHC_POD=$(kubectl get pods -n ${DEPLOY_NAMESPACE} -l control-plane=controller-manager -o jsonpath='{.items[?(@.metadata.name)].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep node-healthcheck | head -1)
+        NHC_POD=$(kubectl get pods -n ${DEPLOY_NHC_NAMESPACE} -o name 2>/dev/null | grep node-healthcheck-controller-manager | head -1 | cut -d/ -f2)
         if [ -n "$NHC_POD" ]; then
-          kubectl logs -n ${DEPLOY_NAMESPACE} "$NHC_POD" --tail=30 2>/dev/null || true
+          kubectl logs -n ${DEPLOY_NHC_NAMESPACE} "$NHC_POD" --tail=30 2>/dev/null || true
         else
           echo "NHC controller pod not found!"
         fi
@@ -147,7 +184,11 @@ jobs:
     # --- Run tests ---
     - name: Run e2e tests
       run: |
-        OPERATOR_NS=${DEPLOY_NAMESPACE} \
+        # Start both background processes in this step so GH Actions keeps them alive
+        export MEDIK8S_REBOOT_DELAY=120
+        make dev-reboot-watcher
+
+        OPERATOR_NS=${DEPLOY_NHC_NAMESPACE} \
         SNR_STRATEGY=OutOfServiceTaint \
         LABEL_FILTER="!OCP-ONLY" \
         make test-e2e

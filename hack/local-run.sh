@@ -17,8 +17,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NHC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SNR_DIR="${NHC_DIR}/../self-node-remediation"
-TOOLS_DIR="${NHC_DIR}/../../shared/tools"
+SNR_DIR="${NHC_DIR}/.snr"
+TOOLS_DIR="${NHC_DIR}/.tools"
+
+# Clone or update .tools directory
+if [ ! -d "${TOOLS_DIR}" ]; then
+    git clone --depth 1 --branch testing-hang https://github.com/mpryc/medik8s-tools.git $TOOLS_DIR
+else
+    echo "Updating existing .tools directory..."
+    (cd "${TOOLS_DIR}" && git fetch origin testing-hang && git reset --hard origin/testing-hang)
+fi
+
+# Clone or update .snr directory
+if [ ! -d "${SNR_DIR}" ]; then
+    git clone --depth 1 https://github.com/medik8s/self-node-remediation $SNR_DIR
+else
+    echo "Updating existing .snr directory..."
+    (cd "${SNR_DIR}" && git fetch origin main && git reset --hard origin/main)
+fi
 
 # --- Configuration (mirrors GitHub Actions env) ---
 export MEDIK8S_CLUSTER_NAME="${MEDIK8S_CLUSTER_NAME:-medik8s-ci}"
@@ -185,6 +201,7 @@ if [ "${SKIP_SETUP}" = false ]; then
     step "Starting reboot watcher"
     cd "${NHC_DIR}"
     make dev-reboot-watcher
+    make dev-webhook-watcher
 
     step "Cluster info"
     cd "${NHC_DIR}"
