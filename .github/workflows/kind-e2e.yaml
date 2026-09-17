@@ -90,12 +90,10 @@ jobs:
           --timeout 5m \
           ${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
 
-        # Patch SNR immediately to move it to the control plane
-        kubectl patch deployment self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} \
-          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
-
     - name: Free Disk Space & RAM
       run: |
+        # Reclaim disk/RAM on the CI runner after SNR build; images are
+        # already pushed to the Kind registry so local copies aren't needed.
         podman image prune -a -f
         podman builder prune -a -f
 
@@ -124,25 +122,64 @@ jobs:
           --timeout 5m \
           ${IMAGE_REGISTRY}/node-healthcheck-operator-bundle:latest
 
-        # Patch NHC immediately to move it to the control plane
-        kubectl patch deployment node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} \
-          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
-
-        # Grant NHC explicit cluster-wide permissions to manage SNR templates and CRs
+        # NHC's aggregated ClusterRole picks up SNR permissions via label selector,
+        # but add an explicit binding as a safety net in case aggregation is slow.
         kubectl create clusterrolebinding nhc-snr-admin-binding \
           --clusterrole=self-node-remediation-ext-remediation \
           --serviceaccount=${DEPLOY_NHC_NAMESPACE}:node-healthcheck-operator-controller-manager \
           2>/dev/null || true
 
-        echo "Waiting for operators to reschedule to control plane and stabilize..."
-        sleep 60
-        kubectl wait --for=condition=Ready pod -l control-plane=controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s || true
-
     - name: Wait for deployments
-      run: make dev-wait
+      run: |
+        # Ensure deployments are Available before proceeding.
+        kubectl rollout status deployment/self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} --timeout=120s
+        kubectl rollout status deployment/node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s
+        make dev-wait
+
+    - name: Move operator pods to control plane
+      run: |
+        # E2e tests stop kubelet on worker nodes, which kills pods on those
+        # workers. Move operator manager pods to the control-plane node so
+        # they survive the simulated failures.
+        #
+        # NOTE: OLM continuously reconciles deployment specs to match the CSV.
+        # It will revert these patches eventually. We patch AFTER rollout is
+        # complete and immediately wait for the new rollout so the pods have
+        # time to reschedule before OLM reverts. The sleep below also gives
+        # OLM time to finish its reconciliation cycle.
+        kubectl patch deployment self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} \
+          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
+
+        kubectl patch deployment node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} \
+          -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
+
+        kubectl rollout status deployment/self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} --timeout=120s
+        kubectl rollout status deployment/node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s
+
+    - name: Wait for controllers to stabilize
+      run: |
+        # Controllers need time after pods are Ready to complete leader election
+        # (default LeaseDuration=15s) and initial reconciliation (informer sync,
+        # RBAC aggregation setup, namespace creation for leases, etc.).
+        # Without this wait the e2e tests race against controller startup and
+        # the NHC reconciler may not yet be active when nodes are made unhealthy.
+        echo "Waiting 30s for leader election and controller initialization..."
+        sleep 30
+
+        # Verify the NHC controller has started reconciling by checking that
+        # the aggregation ClusterRole was created (done in the initializer
+        # which runs after leader election).
+        if kubectl get clusterrole node-healthcheck-operator-aggregation &>/dev/null; then
+          echo "NHC aggregation ClusterRole found — controller is active."
+        else
+          echo "WARNING: aggregation ClusterRole not found, controller may not be ready yet. Waiting 30s more..."
+          sleep 30
+        fi
 
     - name: Dump webhook configurations after bundle installs
       run: |
+        # Both SNR and NHC bundles register webhooks for SNR resources.
+        # Dump them to help diagnose duplicate/broken webhook issues.
         echo "=== MutatingWebhookConfiguration YAML ==="
         kubectl get mutatingwebhookconfigurations -o yaml
         echo ""
@@ -157,7 +194,7 @@ jobs:
     - name: Verify NHC readiness
       run: |
         echo "=== NHC Controller Pod ==="
-        kubectl get pods -n ${DEPLOY_NHC_NAMESPACE} -l control-plane=controller-manager -o wide
+        kubectl get pods -n ${DEPLOY_NHC_NAMESPACE} -l app.kubernetes.io/name=node-healthcheck-operator -o wide
         echo ""
         echo "=== SNR Template CRDs ==="
         kubectl get crd selfnoderemediationtemplates.self-node-remediation.medik8s.io 2>/dev/null && echo "CRD exists" || echo "CRD MISSING"
@@ -184,9 +221,17 @@ jobs:
     # --- Run tests ---
     - name: Run e2e tests
       run: |
-        # Start both background processes in this step so GH Actions keeps them alive
+        # The reboot watcher simulates node reboot on Kind by restarting the
+        # Docker container when kubelet stops. It must run in the same step as
+        # the tests so GH Actions keeps the background process alive.
+        # MEDIK8S_REBOOT_DELAY gives NHC time to detect the unhealthy node
+        # and create the remediation CR before the node comes back.
         export MEDIK8S_REBOOT_DELAY=120
         make dev-reboot-watcher
+
+        echo "=== Verifying Operator Pods ==="
+        kubectl get pods -n ${DEPLOY_SNR_NAMESPACE} -o wide
+        kubectl get pods -n ${DEPLOY_NHC_NAMESPACE} -o wide
 
         OPERATOR_NS=${DEPLOY_NHC_NAMESPACE} \
         SNR_STRATEGY=OutOfServiceTaint \
