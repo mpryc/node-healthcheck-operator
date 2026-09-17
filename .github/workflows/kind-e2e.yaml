@@ -28,6 +28,9 @@ jobs:
       # Deployment
       DEPLOY_SNR_NAMESPACE: snr-system
       DEPLOY_NHC_NAMESPACE: k8s-test
+
+      # Enable GitHub Actions step debug logging
+      ACTIONS_STEP_DEBUG: "true"
       
 
     steps:
@@ -58,6 +61,12 @@ jobs:
     - name: Cluster info
       run: make dev-cluster-info
 
+    - name: Cluster state (after setup)
+      if: ${{ always() }}
+      run: |
+        echo "=== Nodes ===" && kubectl get nodes -o wide 2>/dev/null || true
+        echo "=== All Pods ===" && kubectl get pods -A -o wide 2>/dev/null || true
+
 # --- Deploy SNR from quay.io ---
     - name: Deploy SNR via OLM bundle
       run: |
@@ -69,6 +78,14 @@ jobs:
         operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} \
           --timeout 5m \
           quay.io/medik8s/self-node-remediation-operator-bundle:latest
+
+    - name: Cluster state (after SNR deploy)
+      if: ${{ always() }}
+      run: |
+        echo "=== Pods ===" && kubectl get pods -A -o wide 2>/dev/null || true
+        echo "=== SNR CRDs ===" && kubectl get crd -o name 2>/dev/null | grep -i remediation || echo "none"
+        echo "=== Webhooks ===" && kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name 2>/dev/null || true
+        echo "=== Events (SNR) ===" && kubectl get events -n ${DEPLOY_SNR_NAMESPACE} --sort-by=.lastTimestamp 2>/dev/null | tail -20 || true
 
     # --- Build and deploy NHC ---
     - name: Build and push NHC
@@ -102,6 +119,13 @@ jobs:
           --serviceaccount=${DEPLOY_NHC_NAMESPACE}:node-healthcheck-operator-controller-manager \
           2>/dev/null || true
 
+    - name: Cluster state (after NHC deploy)
+      if: ${{ always() }}
+      run: |
+        echo "=== Pods ===" && kubectl get pods -A -o wide 2>/dev/null || true
+        echo "=== Webhooks ===" && kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name 2>/dev/null || true
+        echo "=== Events (NHC) ===" && kubectl get events -n ${DEPLOY_NHC_NAMESPACE} --sort-by=.lastTimestamp 2>/dev/null | tail -20 || true
+
     - name: Wait for deployments
       run: |
         # Ensure deployments are Available before proceeding.
@@ -128,6 +152,12 @@ jobs:
 
         kubectl rollout status deployment/self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} --timeout=120s
         kubectl rollout status deployment/node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} --timeout=120s
+
+    - name: Cluster state (after move to control plane)
+      if: ${{ always() }}
+      run: |
+        echo "=== Pods ===" && kubectl get pods -A -o wide 2>/dev/null || true
+        echo "=== Deployments ===" && kubectl get deployments -A 2>/dev/null || true
 
     - name: Wait for controllers to stabilize
       run: |
@@ -199,7 +229,10 @@ jobs:
         # the tests so GH Actions keeps the background process alive.
         # MEDIK8S_REBOOT_DELAY gives NHC time to detect the unhealthy node
         # and create the remediation CR before the node comes back.
-        export MEDIK8S_REBOOT_DELAY=60
+        # Timeline: kubelet stops → ~40s node NotReady → +15s unhealthyConditionDuration
+        # → NHC creates remediation CR → SNR processes it.
+        # Delay must exceed 40+15+buffer ≈ 65s so the node stays down long enough.
+        export MEDIK8S_REBOOT_DELAY=90
         make dev-reboot-watcher
 
         echo "=== Verifying Operator Pods ==="

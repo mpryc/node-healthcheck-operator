@@ -246,7 +246,7 @@ step "Running e2e tests"
 cd "${NHC_DIR}"
 
 step "Starting reboot watcher"
-export MEDIK8S_REBOOT_DELAY=120
+export MEDIK8S_REBOOT_DELAY=90
 make dev-reboot-watcher
 
 OPERATOR_NS=${DEPLOY_NHC_NAMESPACE} \

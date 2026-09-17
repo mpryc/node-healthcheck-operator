@@ -42,7 +42,7 @@ func TestE2e(t *testing.T) {
 }
 
 const (
-	unhealthyConditionDuration = 30 * time.Second
+	unhealthyConditionDuration = 15 * time.Second
 )
 
 var (
