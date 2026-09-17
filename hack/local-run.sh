@@ -20,6 +20,9 @@ NHC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SNR_DIR="${NHC_DIR}/.snr"
 TOOLS_DIR="${NHC_DIR}/.tools"
 
+export DEPLOY_SNR_NAMESPACE="${DEPLOY_SNR_NAMESPACE:-snr-system}"
+export DEPLOY_NHC_NAMESPACE="${DEPLOY_NHC_NAMESPACE:-k8s-test}"
+
 # Clone or update .tools directory
 if [ ! -d "${TOOLS_DIR}" ]; then
     git clone --depth 1 --branch testing-hang https://github.com/mpryc/medik8s-tools.git $TOOLS_DIR
@@ -53,7 +56,6 @@ export MEDIK8S_REGISTRY_NAME="${MEDIK8S_REGISTRY_NAME:-kind-registry}"
 export MEDIK8S_REGISTRY_PORT="${MEDIK8S_REGISTRY_PORT:-5000}"
 export IMAGE_REGISTRY="${IMAGE_REGISTRY:-${MEDIK8S_REGISTRY_NAME}:${MEDIK8S_REGISTRY_PORT}}"
 export OPM_RENDER_FLAGS="${OPM_RENDER_FLAGS:---skip-tls-verify}"
-export DEPLOY_NAMESPACE="${DEPLOY_NAMESPACE:-k8s-test}"
 export TOOLS_DIR
 
 SNR_IMG="${IMAGE_REGISTRY}/self-node-remediation:latest"
@@ -81,9 +83,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --teardown     Tear down the cluster and exit"
             echo ""
             echo "Environment variables:"
-            echo "  MEDIK8S_CLUSTER_NAME   Kind cluster name (default: medik8s-ci)"
-            echo "  CONTAINER_TOOL         Container tool (default: docker)"
-            echo "  DEPLOY_NAMESPACE       Namespace for operators (default: k8s-test)"
+            echo "  MEDIK8S_CLUSTER_NAME    Kind cluster name (default: medik8s-ci)"
+            echo "  CONTAINER_TOOL          Container tool (default: docker)"
+            echo "  DEPLOY_SNR_NAMESPACE    Namespace for SNR operator (default: snr-system)"
+            echo "  DEPLOY_NHC_NAMESPACE    Namespace for NHC operator (default: k8s-test)"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -149,8 +152,8 @@ check_and_cleanup_existing_build() {
 }
 
 deployed_resources() {
-    kubectl get subscriptions,csv,deployments -n "${DEPLOY_NAMESPACE}" \
-        -o name 2>/dev/null | grep -E 'self-node-remediation|node-healthcheck-operator' || true
+    kubectl get subscriptions,csv,deployments -n "${DEPLOY_SNR_NAMESPACE}" -o name 2>/dev/null | grep -E 'self-node-remediation' || true
+    kubectl get subscriptions,csv,deployments -n "${DEPLOY_NHC_NAMESPACE}" -o name 2>/dev/null | grep -E 'node-healthcheck-operator' || true
 }
 
 check_and_cleanup_existing_deployment() {
@@ -159,7 +162,7 @@ check_and_cleanup_existing_deployment() {
     echo "=== Checking for existing operator deployments ==="
     resources="$(deployed_resources)"
     if [ -z "${resources}" ]; then
-        echo "  No existing SNR/NHC deployment found in namespace ${DEPLOY_NAMESPACE}."
+        echo "  No existing SNR/NHC deployment found in namespaces."
         return
     fi
 
@@ -167,8 +170,8 @@ check_and_cleanup_existing_deployment() {
     echo "${resources}" | sed 's/^/    /'
     echo "  Removing existing OLM installations..."
 
-    operator-sdk -n "${DEPLOY_NAMESPACE}" cleanup self-node-remediation || true
-    operator-sdk -n "${DEPLOY_NAMESPACE}" cleanup node-healthcheck-operator --delete-all || true
+    operator-sdk -n "${DEPLOY_SNR_NAMESPACE}" cleanup self-node-remediation || true
+    operator-sdk -n "${DEPLOY_NHC_NAMESPACE}" cleanup node-healthcheck-operator --delete-all || true
 
     resources="$(deployed_resources)"
     if [ -n "${resources}" ]; then
@@ -198,11 +201,6 @@ if [ "${SKIP_SETUP}" = false ]; then
     cd "${NHC_DIR}"
     make dev-setup
 
-    step "Starting reboot watcher"
-    cd "${NHC_DIR}"
-    make dev-reboot-watcher
-    make dev-webhook-watcher
-
     step "Cluster info"
     cd "${NHC_DIR}"
     make dev-cluster-info
@@ -230,13 +228,17 @@ if [ "${SKIP_BUILD}" = false ]; then
 
     step "Deploying SNR via OLM bundle"
     cd "${NHC_DIR}"
-    kubectl create ns ${DEPLOY_NAMESPACE} 2>/dev/null || true
-    kubectl label --overwrite ns ${DEPLOY_NAMESPACE} \
+    kubectl create ns ${DEPLOY_SNR_NAMESPACE} 2>/dev/null || true
+    kubectl label --overwrite ns ${DEPLOY_SNR_NAMESPACE} \
         pod-security.kubernetes.io/enforce=privileged \
         pod-security.kubernetes.io/audit=privileged \
         pod-security.kubernetes.io/warn=privileged
-    operator-sdk run bundle -n ${DEPLOY_NAMESPACE} --use-http \
+    operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} --use-http \
+        --timeout 5m \
         ${IMAGE_REGISTRY}/self-node-remediation-operator-bundle:latest
+
+    # Patch SNR immediately to move it to the control plane
+    kubectl patch deployment self-node-remediation-controller-manager -n ${DEPLOY_SNR_NAMESPACE} -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
 
     step "Building and pushing NHC"
     cd "${NHC_DIR}"
@@ -249,9 +251,19 @@ if [ "${SKIP_BUILD}" = false ]; then
 
     step "Deploying NHC via OLM bundle"
     cd "${NHC_DIR}"
-    operator-sdk run bundle -n ${DEPLOY_NAMESPACE} --use-http \
+    kubectl create ns ${DEPLOY_NHC_NAMESPACE} 2>/dev/null || true
+    kubectl label --overwrite ns ${DEPLOY_NHC_NAMESPACE} \
+        pod-security.kubernetes.io/enforce=privileged \
+        pod-security.kubernetes.io/audit=privileged \
+        pod-security.kubernetes.io/warn=privileged
+    operator-sdk run bundle -n ${DEPLOY_NHC_NAMESPACE} --use-http \
+        --timeout 5m \
         ${IMAGE_REGISTRY}/node-healthcheck-operator-bundle:latest
-    echo "Waiting 60s for NHC to stabilize..."
+
+    # Patch NHC immediately to move it to the control plane
+    kubectl patch deployment node-healthcheck-controller-manager -n ${DEPLOY_NHC_NAMESPACE} -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": ""}, "tolerations": [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]}}}}' || true
+    
+    echo "Waiting 60s for operators to reschedule to control plane and stabilize..."
     sleep 60
 else
     echo "Skipping build (--skip-build)"
@@ -269,7 +281,12 @@ make dev-describe
 # --- Run tests ---
 step "Running e2e tests"
 cd "${NHC_DIR}"
-OPERATOR_NS=${DEPLOY_NAMESPACE} \
+
+step "Starting reboot watcher"
+export MEDIK8S_REBOOT_DELAY=120
+make dev-reboot-watcher
+
+OPERATOR_NS=${DEPLOY_NHC_NAMESPACE} \
 SNR_STRATEGY=OutOfServiceTaint \
 LABEL_FILTER='!OCP-ONLY' \
 make test-e2e || {
