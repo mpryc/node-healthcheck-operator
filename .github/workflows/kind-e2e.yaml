@@ -80,7 +80,7 @@ jobs:
           pod-security.kubernetes.io/warn=privileged
         operator-sdk run bundle -n ${DEPLOY_SNR_NAMESPACE} \
           --timeout 5m \
-          quay.io/medik8s/self-node-remediation-operator-bundle:latest
+          quay.io/slintes/self-node-remediation-operator-bundle:v0.1.0-start-kubelet
 
     - name: Cluster state (after SNR deploy)
       if: ${{ always() }}
@@ -215,8 +215,8 @@ jobs:
         # Timeline: kubelet stops → ~40s node NotReady → +15s unhealthyConditionDuration
         # → NHC creates remediation CR → SNR processes it.
         # Delay must exceed 40+15+buffer ≈ 65s so the node stays down long enough.
-        export MEDIK8S_REBOOT_DELAY=90
-        make dev-reboot-watcher
+        # export MEDIK8S_REBOOT_DELAY=90
+        # make dev-reboot-watcher
 
         echo "=== Verifying Operator Pods ==="
         kubectl get pods -n ${DEPLOY_SNR_NAMESPACE} -o wide
